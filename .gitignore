@@ -1,1 +1,15 @@
+# 敏感配置文件
+.env
+
+# 日志文件
+*.log
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
 .venv/
+venv/
+env/
