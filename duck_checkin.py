@@ -24,16 +24,18 @@ RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL")
 # ==========================================
 # 配置区二：Duckcoding 签到网络请求参数
 # ==========================================
+LOGIN_URL = "https://duckcoding.com/api/user/login"
 CHECKIN_URL = "https://duckcoding.com/api/user/checkin"
+DUCK_EMAIL = os.getenv("DUCK_EMAIL")
+DUCK_PASSWORD = os.getenv("DUCK_PASSWORD")
 SESSION_COOKIE = os.getenv("SESSION_COOKIE")
 NEW_API_USER = os.getenv("NEW_API_USER")
 
-HEADERS = {
+BASE_HEADERS = {
     "accept": "application/json, text/plain, */*",
     "accept-language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     "cache-control": "no-store",
-    "cookie": f"session={SESSION_COOKIE}",
-    "new-api-user": NEW_API_USER,
+    "content-type": "application/json",
     "origin": "https://duckcoding.com",
     "referer": "https://duckcoding.com/console/personal",
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
@@ -55,44 +57,109 @@ def send_alert_email(subject, content):
     except Exception as e:
         print(f"[{datetime.datetime.now()}] 严重错误：告警邮件发送失败 - {e}")
 
+def login():
+    """使用邮箱密码登录，获取 session cookie"""
+    if not DUCK_EMAIL or not DUCK_PASSWORD:
+        print(f"[{datetime.datetime.now()}] 未配置邮箱密码，尝试使用预设的 session cookie")
+        return SESSION_COOKIE
+
+    print(f"[{datetime.datetime.now()}] 开始登录...")
+    login_headers = BASE_HEADERS.copy()
+    login_headers["referer"] = "https://duckcoding.com/login"
+
+    payload = {
+        "username": DUCK_EMAIL,
+        "password": DUCK_PASSWORD
+    }
+
+    try:
+        response = requests.post(LOGIN_URL, json=payload, headers=login_headers, timeout=15)
+        response.raise_for_status()
+        result = response.json()
+
+        if result.get('success'):
+            # 从响应的 cookies 中获取 session
+            session_cookie = response.cookies.get('session')
+            if session_cookie:
+                print(f"[{datetime.datetime.now()}] 登录成功，已获取 session")
+                return session_cookie
+            else:
+                raise Exception("登录成功但未获取到 session cookie")
+        else:
+            raise Exception(f"登录失败: {result.get('message', '未知错误')}")
+
+    except Exception as e:
+        print(f"[{datetime.datetime.now()}] 登录异常: {e}")
+        raise
+
 def do_checkin():
     print(f"[{datetime.datetime.now()}] 开始执行 Duckcoding 签到任务...")
+
+    session = None
     try:
-        # 发起 POST 请求
-        response = requests.post(CHECKIN_URL, headers=HEADERS, timeout=15)
-        
-        # 1. 拦截 HTTP 协议层面的失败 (401, 403, 500 等)
-        response.raise_for_status() 
-        
-        # 2. 尝试解析业务层面的 JSON 响应
+        # 优先使用邮箱密码登录获取 session
+        if DUCK_EMAIL and DUCK_PASSWORD:
+            session = login()
+        elif SESSION_COOKIE:
+            print(f"[{datetime.datetime.now()}] 使用预设的 session cookie")
+            session = SESSION_COOKIE
+        else:
+            raise Exception("既未配置邮箱密码，也未配置 session cookie")
+
+        # 构建签到请求头
+        checkin_headers = BASE_HEADERS.copy()
+        checkin_headers["cookie"] = f"session={session}"
+        checkin_headers["new-api-user"] = NEW_API_USER
+
+        # 发起签到请求
+        response = requests.post(CHECKIN_URL, headers=checkin_headers, timeout=15)
+        response.raise_for_status()
+
         try:
             result = response.json()
         except ValueError:
-            # 如果服务器返回的不是 JSON（比如 Nginx 的 502 HTML 页面），立刻判定为异常
             error_msg = f"服务器返回了非预期的格式 (非JSON)。\n状态码: {response.status_code}\n返回内容: {response.text[:200]}"
             print(f"[{datetime.datetime.now()}] 解析异常: {error_msg}")
             send_alert_email("🚨 签到异常：服务器返回格式错误", error_msg)
             return
 
-        # 3. 拦截业务逻辑层面的失败 (状态码是200，但提示失败)
-        # 注意：这里假设 JSON 中包含 code 或 msg 字段。你需要根据实际成功的 JSON 调整。
-        # 如果你明确知道成功的 JSON 是什么，请修改这里的 if 条件。
         print(f"[{datetime.datetime.now()}] 响应内容: {result}")
-        # 这是一个保守的防御逻辑：只要能正常解析到这步，且 HTTP 是 200，我们暂时认为它成功。
-        # 如果你知道具体的失败特征（例如 result.get('code') != 200），应该在这里抛出异常并发送邮件。
-        
-        print(f"[{datetime.datetime.now()}] 签到成功，不触发邮件。")
-        sys.exit(0) # 正常退出
+
+        if result.get('success'):
+            print(f"[{datetime.datetime.now()}] 签到成功，不触发邮件。")
+            sys.exit(0)
+        elif result.get('message') == '今日已签到':
+            print(f"[{datetime.datetime.now()}] 今日已签到，不触发邮件。")
+            sys.exit(0)
+        else:
+            # 可能是 session 过期，如果配置了邮箱密码则尝试重新登录
+            if DUCK_EMAIL and DUCK_PASSWORD:
+                print(f"[{datetime.datetime.now()}] 签到失败，可能 session 过期，尝试重新登录...")
+                session = login()
+                checkin_headers["cookie"] = f"session={session}"
+                response = requests.post(CHECKIN_URL, headers=checkin_headers, timeout=15)
+                response.raise_for_status()
+                result = response.json()
+                print(f"[{datetime.datetime.now()}] 重试后响应: {result}")
+
+                if result.get('success'):
+                    print(f"[{datetime.datetime.now()}] 重试签到成功。")
+                    sys.exit(0)
+                elif result.get('message') == '今日已签到':
+                    print(f"[{datetime.datetime.now()}] 今日已签到，不触发邮件。")
+                    sys.exit(0)
+                else:
+                    raise Exception(f"签到失败: {result.get('message', '未知错误')}")
+            else:
+                raise Exception(f"签到失败: {result.get('message', '未知错误')}")
 
     except requests.exceptions.RequestException as e:
-        # 捕获所有网络层面的崩溃 (超时、DNS失败、401等)
         response_body = e.response.text if hasattr(e, 'response') and e.response is not None else "无响应体"
         error_msg = f"网络协议崩溃或凭证失效。\n错误详情：{e}\n服务器真实报文：{response_body}"
         print(f"[{datetime.datetime.now()}] 网络崩溃: {error_msg}")
         send_alert_email("🚨 签到异常：网络或权限被拒绝", error_msg)
-        
+
     except Exception as e:
-        # 捕获其他未知崩溃（例如内存溢出、环境配置错误）
         error_trace = traceback.format_exc()
         print(f"[{datetime.datetime.now()}] 未知崩溃:\n{error_trace}")
         send_alert_email("🚨 签到异常：脚本发生未知崩溃", error_trace)

@@ -10,6 +10,5 @@ __pycache__/
 *$py.class
 
 # 虚拟环境
-.venv/
 venv/
 env/
